@@ -3,10 +3,10 @@ name: runpod-core
 description: >
   Charger ce skill dès qu'un pod RunPod est impliqué dans la tâche,
   quel que soit le projet (ML, API, scaling, data pipeline).
-  Prérequis : install.sh a été lancé sur le pod.
+  Prérequis : install.sh lancé sur le pod ET port 2222 exposé RunPod.
   Ce skill est le prérequis de runpod-monitor.
-  Modules optionnels disponibles : runpod-monitor (tâches longues autonomes),
-  runpod-jupyter (si JupyterLab tourne sur le pod).
+  Module optionnel : runpod-monitor pour tâches longues (> 30 minutes).
+  Tunnel Jupyter disponible si JupyterLab tourne sur le pod.
 ---
 
 # RunPod Core — Pilotage de Pod depuis Claude Code
@@ -15,11 +15,12 @@ description: >
 
 ### Ce que install.sh garantit sur le pod
 
-- `podctl` installé dans `/usr/local/bin/podctl`
+- `podctl` installé dans `/usr/local/bin/podctl` ET sauvegardé dans `/workspace/claude/podctl`
 - `logd.py` daemon tournant en background, écrit dans `/workspace/claude/stream.jsonl`
 - sshd dédié sur le port 2222 (séparé du port humain)
 - Structure `/workspace/claude/`, `/workspace/logs/`, `/workspace/pids/`
 - Script `/workspace/start.sh` pour relancer les services après reboot
+- Fichiers persistants dans `/workspace/claude/` (survivent aux reboots)
 
 ### Ce que la machine locale doit avoir configuré
 
@@ -27,21 +28,37 @@ description: >
 - Alias SSH dans `~/.ssh/config` pour chaque pod (format `runpod-{alias}`)
 - ControlMaster activé pour multiplexage des canaux
 
-### Vérification avant de commencer
+### Procédure de début de session (OBLIGATOIRE)
 
-Au début de CHAQUE session impliquant un pod, exécuter :
+Exécuter dans cet ordre exact. Ne pas sauter une étape.
+
+**Étape 1 — Test de connectivité**
 
 ```bash
-ssh runpod-{alias} "podctl status"
+ssh runpod-{alias} "echo connection_ok" 2>&1
 ```
 
-Si la commande échoue ou si les services sont down :
+Si échoue : Pod inaccessible. Dire à l'utilisateur : "Pod inaccessible. Vérifiez que le pod est démarré et que le port 2222 est exposé dans la configuration RunPod." Arrêter.
+
+**Étape 2 — Vérification des services**
+
+```bash
+ssh runpod-{alias} "podctl health"
+```
+
+Si `command not found` : install.sh n'a pas été lancé. Dire : "podctl absent. Lancez install.sh sur le pod." Arrêter.
+
+Si `healthy: true` : continuer directement.
+
+Si `healthy: false` : tenter la relance automatique :
 
 ```bash
 ssh runpod-{alias} "/workspace/start.sh"
+sleep 3
+ssh runpod-{alias} "podctl health"
 ```
 
-Puis re-vérifier avec `podctl status`.
+Si toujours `healthy: false` après start.sh : Dire : "Services non récupérables. Le pod a peut-être été recréé. Relancez install.sh sur le pod." Arrêter.
 
 ## 2 — Connexion SSH
 
@@ -91,51 +108,36 @@ Snapshot global du pod.
 ssh runpod-{alias} "podctl status"
 ```
 
-Retour :
-```json
-{
-  "ts": 1700000123,
-  "type": "status",
-  "hostname": "runpod-abc123",
-  "uptime": "up 4 hours, 23 minutes",
-  "cpu_pct": 12.3,
-  "ram": {"used_gb": 45.2, "total_gb": 64.0, "pct": 70.6},
-  "disk": {"used_gb": 120.0, "total_gb": 500.0, "free_gb": 380.0, "pct": 24.0},
-  "gpu": [{"index": 0, "name": "A100-SXM4-80GB", "util_pct": 94, "mem_used_mb": 72000, "mem_total_mb": 81920, "temp_c": 62}],
-  "services": {"logd": {"pid": 1234, "alive": true}, "sshd_claude": {"pid": 5678, "alive": true}},
-  "stream_size_mb": 12.3
-}
+### podctl health
+
+Évaluation binaire de l'état du pod.
+
+```bash
+ssh runpod-{alias} "podctl health"
 ```
+
+Retour : `healthy: true/false` avec détails par check (logd, sshd, stream, disk, gpu).
+
+### podctl watch
+
+Boucle de polling intégrée.
+
+```bash
+ssh runpod-{alias} "podctl watch 30"    # poll toutes les 30s
+ssh runpod-{alias} "podctl watch 60"    # poll toutes les 60s
+```
+
+Émet un JSON summary par cycle. Arrêt propre sur SIGTERM/SIGINT.
 
 ### podctl logs
 
 Logs filtrés depuis `stream.jsonl`.
 
 ```bash
-# Logs récents
 ssh runpod-{alias} "podctl logs recent 5m"
-
-# Filtrer par niveau
 ssh runpod-{alias} "podctl logs filter error 1h"
-
-# Recherche par pattern regex
 ssh runpod-{alias} "podctl logs search 'cuda|oom' 30m"
-
-# Logs d'un kernel Jupyter spécifique
 ssh runpod-{alias} "podctl logs kernel a3f9bc 20"
-```
-
-Retour `logs recent` :
-```json
-{
-  "type": "logs_recent",
-  "duration": "5m",
-  "count": 42,
-  "entries": [
-    {"ts": 1700000123, "source": "training", "level": "INFO", "msg": "Epoch 42, loss=0.234"},
-    {"ts": 1700000125, "source": "system.gpu", "util_pct": 94, "mem_used_mb": 72000, "mem_total_mb": 81920}
-  ]
-}
 ```
 
 ### podctl ps
@@ -146,17 +148,6 @@ Processus actifs, triés par CPU%.
 ssh runpod-{alias} "podctl ps"
 ```
 
-Retour :
-```json
-{
-  "type": "ps",
-  "count": 15,
-  "processes": [
-    {"pid": 4521, "name": "python3", "cmd": "python3 train.py --epochs 50", "cpu_pct": 340.0, "ram_mb": 12400, "uptime_s": 14400}
-  ]
-}
-```
-
 ### podctl gpu
 
 État GPU détaillé.
@@ -165,35 +156,12 @@ Retour :
 ssh runpod-{alias} "podctl gpu"
 ```
 
-Retour :
-```json
-{
-  "type": "gpu",
-  "available": true,
-  "gpus": [
-    {"index": 0, "name": "A100-SXM4-80GB", "util_pct": 94, "mem_used_mb": 72000, "mem_total_mb": 81920, "temp_c": 62}
-  ]
-}
-```
-
 ### podctl exec
 
 Exécuter une commande avec retour structuré.
 
 ```bash
 ssh runpod-{alias} "podctl exec 'pip list | grep torch'"
-```
-
-Retour :
-```json
-{
-  "type": "exec",
-  "command": "pip list | grep torch",
-  "returncode": 0,
-  "stdout": "torch   2.8.0\ntorchaudio   2.8.0\ntorchvision   0.20.0",
-  "stderr": "",
-  "elapsed_s": 1.23
-}
 ```
 
 Options : `--timeout 60` pour les commandes longues.
@@ -206,35 +174,18 @@ Résumé compact (<300 tokens). Idéal pour le polling en mode monitor.
 ssh runpod-{alias} "podctl summary"
 ```
 
-Retour :
-```json
-{
-  "ts": 1700000123,
-  "type": "summary",
-  "services": {"logd": {"pid": 1234, "alive": true}, "sshd_claude": {"pid": 5678, "alive": true}},
-  "gpu": "94% util, 72000/81920MB",
-  "ram": "45.2/64.0GB (70.6%)",
-  "disk": "380.0GB free (24.0% used)",
-  "top_proc": "python3 (PID 4521) 340.0% CPU",
-  "last_event": {"ts": 1700000120, "source": "training", "msg": "Epoch 42, loss=0.234"}
-}
-```
-
 ### podctl jupyter
 
 Opérations Jupyter (si module installé).
 
 ```bash
-# Lister les kernels
 ssh runpod-{alias} "podctl jupyter kernels"
-
-# Outputs d'un kernel
 ssh runpod-{alias} "podctl jupyter outputs a3f9bc 20"
 ```
 
 ## 4 — SSH brut (quand podctl ne suffit pas)
 
-Claude Code a un accès root complet sur le pod. Utiliser SSH brut pour tout ce que podctl ne couvre pas.
+Claude Code a un accès root complet sur le pod.
 
 ### Créer un fichier distant
 
@@ -242,90 +193,74 @@ Claude Code a un accès root complet sur le pod. Utiliser SSH brut pour tout ce 
 ssh runpod-{alias} "cat > /workspace/config.yaml << 'FILEEOF'
 learning_rate: 0.001
 batch_size: 32
-epochs: 50
 FILEEOF"
-```
-
-### Modifier un fichier distant
-
-```bash
-ssh runpod-{alias} "sed -i 's/batch_size: 32/batch_size: 16/' /workspace/config.yaml"
-```
-
-### Lire un fichier distant
-
-```bash
-ssh runpod-{alias} "cat /workspace/config.yaml"
-```
-
-### Transférer des fichiers
-
-```bash
-# Local → Pod
-scp -F ~/.ssh/config local_file.py runpod-{alias}:/workspace/
-
-# Pod → Local
-scp -F ~/.ssh/config runpod-{alias}:/workspace/results.json ./
 ```
 
 ### Lancer un process en background
 
 ```bash
-ssh runpod-{alias} "nohup python3 /workspace/train.py > /workspace/logs/training.log 2>&1 & echo \$! > /workspace/pids/training.pid"
+ssh runpod-{alias} "PYTHONUNBUFFERED=1 nohup python3 /workspace/train.py > /workspace/logs/training.log 2>&1 & echo \$! > /workspace/pids/training.pid"
 ```
 
 logd.py capturera automatiquement les logs écrits dans `/workspace/logs/training.log`.
 
-### Tuer un process
+### Transférer des fichiers
 
 ```bash
-ssh runpod-{alias} "kill \$(cat /workspace/pids/training.pid)"
-```
-
-### Explorer le filesystem
-
-```bash
-ssh runpod-{alias} "ls -la /workspace/"
-ssh runpod-{alias} "find /workspace -name '*.py' -type f"
-ssh runpod-{alias} "du -sh /workspace/*"
+scp -F ~/.ssh/config local_file.py runpod-{alias}:/workspace/
+scp -F ~/.ssh/config runpod-{alias}:/workspace/results.json ./
 ```
 
 ## 5 — Gestion multi-pods
 
-### Nommage des alias SSH
+Convention : `runpod-{projet}` ou `runpod-{rôle}`.
 
-Convention : `runpod-{projet}` ou `runpod-{rôle}`
-
-Exemples :
-- `runpod-btc` — pod pour le projet BTC
-- `runpod-api` — pod servant l'API de production
-- `runpod-worker` — pod worker pour les tâches batch
-
-### Vérifier tous les pods
+La clé `~/.ssh/claude_code_ed25519` est partagée entre tous les pods. Déposer la clé publique sur chaque pod dans `/workspace/claude/authorized_keys`.
 
 ```bash
 ssh runpod-btc "podctl summary"
 ssh runpod-api "podctl summary"
 ```
 
-### Coordonner des actions sur plusieurs pods
+## 6 — Tunnel Jupyter (API REST)
 
-Exemple : déployer une mise à jour sur pod-api et pod-worker :
+### Ouvrir le tunnel
 
 ```bash
-# 1. Upload le nouveau code
-scp -F ~/.ssh/config app.py runpod-api:/workspace/app.py
-scp -F ~/.ssh/config worker.py runpod-worker:/workspace/worker.py
-
-# 2. Redémarrer les services
-ssh runpod-api "kill \$(cat /workspace/pids/api.pid) && nohup python3 /workspace/app.py > /workspace/logs/api.log 2>&1 & echo \$! > /workspace/pids/api.pid"
-ssh runpod-worker "kill \$(cat /workspace/pids/worker.pid) && nohup python3 /workspace/worker.py > /workspace/logs/worker.log 2>&1 & echo \$! > /workspace/pids/worker.pid"
-
-# 3. Vérifier
-ssh runpod-api "podctl status"
-ssh runpod-worker "podctl status"
+ssh -N -L 8888:localhost:8888 runpod-{alias} &
+echo $! > /tmp/jupyter_tunnel_runpod_{alias}.pid
 ```
 
-### Même clé SSH pour tous les pods
+### Obtenir le token Jupyter
 
-La clé `~/.ssh/claude_code_ed25519` est partagée entre tous les pods. Déposer la clé publique sur chaque pod via `install.sh` ou manuellement dans `/etc/ssh/sshd_claude_authorized_keys`.
+```bash
+ssh runpod-{alias} "podctl exec 'jupyter server list --json 2>/dev/null'"
+```
+
+Le token est dans le champ `token` du JSON retourné.
+
+### Vérifier que le tunnel fonctionne
+
+```bash
+curl -s http://localhost:8888/api -H "Authorization: token {TOKEN}" | python3 -m json.tool
+```
+
+### Lister les kernels actifs
+
+```bash
+curl -s http://localhost:8888/api/kernels \
+  -H "Authorization: token {TOKEN}"
+```
+
+### Fermer le tunnel
+
+```bash
+kill $(cat /tmp/jupyter_tunnel_runpod_{alias}.pid)
+```
+
+### Quand utiliser le tunnel vs podctl jupyter
+
+- `podctl jupyter kernels` : état rapide, pas besoin de tunnel
+- `podctl jupyter outputs` : logs des cellules, pas besoin de tunnel
+- API REST directe : pour exécuter du code programmatiquement dans un kernel
+- Utiliser le tunnel uniquement quand nécessaire, fermer après usage

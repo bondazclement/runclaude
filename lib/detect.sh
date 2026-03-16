@@ -1,31 +1,53 @@
 #!/usr/bin/env bash
-# detect.sh — Détection de l'environnement d'exécution
-# Retourne : "runpod", "local", ou "unknown"
+# detect.sh — Détection robuste de l'environnement
 
 detect_environment() {
-    # Check 1 — Pod RunPod ?
-    if [ -n "$RUNPOD_POD_ID" ] || [ -f /etc/runpod ] || hostname 2>/dev/null | grep -qi runpod; then
-        echo "runpod"
-        return 0
+    # Critère A — Variables d'environnement RunPod officielles
+    if [ -n "${RUNPOD_POD_ID:-}" ] || \
+       [ -n "${RUNPOD_DC_ID:-}" ] || \
+       [ -n "${RUNPOD_POD_HOSTNAME:-}" ]; then
+        echo "runpod"; return 0
     fi
 
-    # Check 2 — Machine utilisateur Linux ?
-    if [ -n "$HOME" ] && [ "$HOME" != "/root" ] && [ -z "$RUNPOD_POD_ID" ]; then
-        echo "local"
-        return 0
+    # Critère B — Fichier marqueur Docker + /workspace accessible en écriture
+    if [ -f "/.dockerenv" ] && [ -d "/workspace" ] && [ -w "/workspace" ]; then
+        echo "runpod"; return 0
     fi
 
-    # Check 3 — Root sur une machine non-RunPod (peut être un serveur perso)
-    if [ "$HOME" = "/root" ] && [ -z "$RUNPOD_POD_ID" ] && ! [ -f /etc/runpod ]; then
-        echo "local"
-        return 0
+    # Critère C — Hostname contient "runpod"
+    if hostname 2>/dev/null | grep -qi "runpod"; then
+        echo "runpod"; return 0
     fi
 
-    echo "unknown"
-    return 1
+    # Critère D — /etc/runpod existe (certaines images)
+    if [ -f "/etc/runpod" ]; then
+        echo "runpod"; return 0
+    fi
+
+    # Machine locale — tout le reste
+    echo "local"
+    return 0
 }
 
-# Si exécuté directement (pas sourcé), afficher le résultat
+# Mode debug — afficher tous les critères évalués
+print_detection_debug() {
+    echo "=== Detection Debug ==="
+    echo "RUNPOD_POD_ID=${RUNPOD_POD_ID:-<unset>}"
+    echo "RUNPOD_DC_ID=${RUNPOD_DC_ID:-<unset>}"
+    echo "RUNPOD_POD_HOSTNAME=${RUNPOD_POD_HOSTNAME:-<unset>}"
+    echo "/.dockerenv exists: $([ -f /.dockerenv ] && echo yes || echo no)"
+    echo "/workspace exists+writable: $([ -d /workspace ] && [ -w /workspace ] && echo yes || echo no)"
+    echo "hostname: $(hostname 2>/dev/null || echo unknown)"
+    echo "HOME=$HOME"
+    echo "========================"
+}
+
+# Si RUNPOD_TOOL_DEBUG=1, afficher le debug avant de détecter
+if [ "${RUNPOD_TOOL_DEBUG:-0}" = "1" ]; then
+    print_detection_debug
+fi
+
+# Si exécuté directement
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     detect_environment
 fi

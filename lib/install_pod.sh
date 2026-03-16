@@ -4,11 +4,13 @@
 
 install_pod() {
     local SCRIPT_DIR="$1"
+    local WORKSPACE="${WORKSPACE:-/workspace}"
+    local CLAUDE_DIR="${WORKSPACE}/claude"
 
     # ──────────────────────────────────────────────
-    # [1/6] Vérification des prérequis
+    # [1/7] Vérification des prérequis
     # ──────────────────────────────────────────────
-    print_step "1/6" "Vérification des prérequis"
+    print_step "1/7" "Vérification des prérequis"
 
     local HAS_NVIDIA=false
 
@@ -17,6 +19,7 @@ install_pod() {
         print_ok "python3 $(python3 --version 2>&1 | awk '{print $2}')"
     else
         print_err "python3 non trouvé — requis"
+        echo "  Action : apt-get install python3 python3-pip"
         exit 1
     fi
 
@@ -25,6 +28,7 @@ install_pod() {
         print_ok "pip disponible"
     else
         print_err "pip non trouvé — requis"
+        echo "  Action : apt-get install python3-pip"
         exit 1
     fi
 
@@ -38,6 +42,7 @@ install_pod() {
             print_ok "sshd installé"
         else
             print_err "Impossible d'installer sshd"
+            echo "  Action : apt-get update && apt-get install openssh-server"
             exit 1
         fi
     fi
@@ -53,92 +58,86 @@ install_pod() {
     echo ""
 
     # ──────────────────────────────────────────────
-    # [2/6] Structure /workspace standard
+    # [2/7] Structure /workspace standard
     # ──────────────────────────────────────────────
-    print_step "2/6" "Création de la structure /workspace"
+    print_step "2/7" "Création de la structure /workspace"
 
-    mkdir -p /workspace/claude
-    mkdir -p /workspace/logs
-    mkdir -p /workspace/pids
+    mkdir -p "${CLAUDE_DIR}"
+    mkdir -p "${CLAUDE_DIR}/hostkeys"
+    mkdir -p "${WORKSPACE}/logs"
+    mkdir -p "${WORKSPACE}/pids"
 
     # Initialiser stream.jsonl s'il n'existe pas
-    touch /workspace/claude/stream.jsonl
+    touch "${CLAUDE_DIR}/stream.jsonl"
 
     # Initialiser monitor_state.json
-    if [ ! -f /workspace/claude/monitor_state.json ]; then
-        echo '{"status": "idle", "alerts": [], "last_check": null}' > /workspace/claude/monitor_state.json
+    if [ ! -f "${CLAUDE_DIR}/monitor_state.json" ]; then
+        echo '{"status": "idle", "alerts": [], "last_check": null}' > "${CLAUDE_DIR}/monitor_state.json"
     fi
 
-    print_ok "/workspace/claude/"
-    print_ok "/workspace/logs/"
-    print_ok "/workspace/pids/"
+    print_ok "${CLAUDE_DIR}/"
+    print_ok "${CLAUDE_DIR}/hostkeys/"
+    print_ok "${WORKSPACE}/logs/"
+    print_ok "${WORKSPACE}/pids/"
 
     echo ""
 
     # ──────────────────────────────────────────────
-    # [3/6] Installation podctl + logd
+    # [3/7] Installation podctl + logd
     # ──────────────────────────────────────────────
-    print_step "3/6" "Installation podctl + logd"
+    print_step "3/7" "Installation podctl + logd"
 
-    # Copier podctl
+    # Copier podctl vers /usr/local/bin/ (actif immédiatement)
     cp "${SCRIPT_DIR}/pod/podctl" /usr/local/bin/podctl
     chmod +x /usr/local/bin/podctl
     print_ok "podctl → /usr/local/bin/podctl"
 
+    # Copier podctl dans /workspace/claude/ (persiste entre reboots)
+    cp "${SCRIPT_DIR}/pod/podctl" "${CLAUDE_DIR}/podctl"
+    chmod +x "${CLAUDE_DIR}/podctl"
+    print_ok "podctl → ${CLAUDE_DIR}/podctl (persistant)"
+
     # Copier logd.py
-    cp "${SCRIPT_DIR}/pod/logd.py" /workspace/claude/logd.py
-    chmod +x /workspace/claude/logd.py
-    print_ok "logd.py → /workspace/claude/logd.py"
+    cp "${SCRIPT_DIR}/pod/logd.py" "${CLAUDE_DIR}/logd.py"
+    chmod +x "${CLAUDE_DIR}/logd.py"
+    print_ok "logd.py → ${CLAUDE_DIR}/logd.py"
 
     # Installer les dépendances Python
     python3 -m pip install --quiet psutil watchdog 2>/dev/null
     print_ok "Dépendances Python installées (psutil, watchdog)"
 
+    # Test podctl
+    if podctl --help >/dev/null 2>&1; then
+        print_ok "podctl opérationnel"
+    else
+        print_err "podctl installé mais non fonctionnel"
+        exit 1
+    fi
+
     echo ""
 
     # ──────────────────────────────────────────────
-    # [4/6] Second sshd sur port 2222
+    # [4/7] Génération hostkeys persistantes
     # ──────────────────────────────────────────────
-    print_step "4/6" "Configuration sshd dédié (port 2222)"
+    print_step "4/7" "Clés et configuration SSH persistantes"
 
-    local SSHD_CLAUDE_CONFIG="/etc/ssh/sshd_claude_config"
-    local SSHD_CLAUDE_KEYS="/etc/ssh/sshd_claude_authorized_keys"
-    local SSHD_CLAUDE_HOSTKEY_DIR="/etc/ssh/claude_hostkeys"
-
-    # Vérifier si déjà en cours d'exécution
-    if pgrep -f "sshd.*sshd_claude_config" >/dev/null 2>&1; then
-        print_warn "sshd dédié déjà en cours d'exécution — skip"
+    # Générer les hostkeys dans /workspace/claude/hostkeys/ (persiste)
+    if [ ! -f "${CLAUDE_DIR}/hostkeys/ssh_host_ed25519_key" ]; then
+        ssh-keygen -t ed25519 \
+            -f "${CLAUDE_DIR}/hostkeys/ssh_host_ed25519_key" \
+            -N "" -q
+        print_ok "Host keys générées dans ${CLAUDE_DIR}/hostkeys/"
     else
-        # Créer le répertoire pour les host keys dédiées
-        mkdir -p "$SSHD_CLAUDE_HOSTKEY_DIR"
+        print_ok "Host keys existantes dans ${CLAUDE_DIR}/hostkeys/"
+    fi
 
-        # Générer des host keys dédiées si absentes
-        if [ ! -f "${SSHD_CLAUDE_HOSTKEY_DIR}/ssh_host_ed25519_key" ]; then
-            ssh-keygen -t ed25519 -f "${SSHD_CLAUDE_HOSTKEY_DIR}/ssh_host_ed25519_key" -N "" -q
-            print_ok "Host keys dédiées générées"
-        else
-            print_ok "Host keys dédiées existantes"
-        fi
-
-        # Créer le fichier authorized_keys s'il n'existe pas
-        if [ ! -f "$SSHD_CLAUDE_KEYS" ]; then
-            touch "$SSHD_CLAUDE_KEYS"
-            chmod 600 "$SSHD_CLAUDE_KEYS"
-        fi
-
-        # Copier la clé publique depuis authorized_keys root si elle existe
-        if [ -f /root/.ssh/authorized_keys ] && [ ! -s "$SSHD_CLAUDE_KEYS" ]; then
-            cp /root/.ssh/authorized_keys "$SSHD_CLAUDE_KEYS"
-            print_ok "Clés autorisées copiées depuis /root/.ssh/authorized_keys"
-        fi
-
-        # Générer la config sshd dédiée
-        cat > "$SSHD_CLAUDE_CONFIG" <<SSHD_EOF
+    # Stocker le template sshd avec des placeholders
+    cat > "${CLAUDE_DIR}/sshd_claude.conf.template" << 'SSHD_TEMPLATE'
 # sshd configuration dédiée Claude Code
 Port 2222
 ListenAddress 0.0.0.0
-HostKey ${SSHD_CLAUDE_HOSTKEY_DIR}/ssh_host_ed25519_key
-AuthorizedKeysFile ${SSHD_CLAUDE_KEYS}
+HostKey HOSTKEYS_DIR/ssh_host_ed25519_key
+AuthorizedKeysFile AUTH_KEYS_FILE
 
 # Authentification
 PubkeyAuthentication yes
@@ -150,7 +149,6 @@ UsePAM no
 # Sécurité
 X11Forwarding no
 PrintMotd no
-AcceptEnv LANG LC_*
 
 # Keepalive
 ClientAliveInterval 30
@@ -165,41 +163,95 @@ Subsystem sftp /usr/lib/openssh/sftp-server
 # Autoriser le forwarding pour Jupyter tunnel
 AllowTcpForwarding yes
 GatewayPorts no
-SSHD_EOF
+SSHD_TEMPLATE
 
-        print_ok "Configuration sshd dédiée créée"
+    print_ok "Template sshd → ${CLAUDE_DIR}/sshd_claude.conf.template"
+
+    # Créer authorized_keys s'il n'existe pas
+    if [ ! -f "${CLAUDE_DIR}/authorized_keys" ]; then
+        touch "${CLAUDE_DIR}/authorized_keys"
+        chmod 600 "${CLAUDE_DIR}/authorized_keys"
+    fi
+
+    # Copier les clés depuis /root/.ssh/authorized_keys si disponibles et authorized_keys vide
+    if [ -f /root/.ssh/authorized_keys ] && [ -s /root/.ssh/authorized_keys ] && [ ! -s "${CLAUDE_DIR}/authorized_keys" ]; then
+        cp /root/.ssh/authorized_keys "${CLAUDE_DIR}/authorized_keys"
+        local KEY_COUNT
+        KEY_COUNT=$(wc -l < "${CLAUDE_DIR}/authorized_keys")
+        print_ok "Clés copiées depuis /root/.ssh/authorized_keys (${KEY_COUNT} clé(s))"
+    fi
+
+    echo ""
+
+    # ──────────────────────────────────────────────
+    # [5/7] Second sshd sur port 2222
+    # ──────────────────────────────────────────────
+    print_step "5/7" "Démarrage sshd dédié (port 2222)"
+
+    local SSHD_CONFIG="/etc/ssh/sshd_claude.conf"
+
+    # Vérifier si déjà en cours d'exécution
+    if pgrep -f "sshd.*sshd_claude" >/dev/null 2>&1; then
+        print_warn "sshd dédié déjà en cours d'exécution — skip"
+    else
+        # Générer la config active depuis le template
+        cp "${CLAUDE_DIR}/sshd_claude.conf.template" "$SSHD_CONFIG"
+        sed -i "s|HOSTKEYS_DIR|${CLAUDE_DIR}/hostkeys|g" "$SSHD_CONFIG"
+        sed -i "s|AUTH_KEYS_FILE|${CLAUDE_DIR}/authorized_keys|g" "$SSHD_CONFIG"
+        print_ok "Configuration sshd active créée"
 
         # Démarrer le sshd dédié
-        /usr/sbin/sshd -f "$SSHD_CLAUDE_CONFIG"
+        /usr/sbin/sshd -f "$SSHD_CONFIG"
         print_ok "sshd démarré sur port 2222"
     fi
 
-    echo ""
-
-    # ──────────────────────────────────────────────
-    # [5/6] Démarrage logd en background
-    # ──────────────────────────────────────────────
-    print_step "5/6" "Démarrage logd"
-
-    # Vérifier si déjà en cours d'exécution
-    if [ -f /workspace/pids/logd.pid ] && kill -0 "$(cat /workspace/pids/logd.pid)" 2>/dev/null; then
-        print_warn "logd déjà en cours d'exécution (PID $(cat /workspace/pids/logd.pid)) — skip"
+    # Test sshd
+    if pgrep -f "sshd.*sshd_claude" >/dev/null 2>&1; then
+        print_ok "sshd port 2222 actif"
     else
-        nohup python3 /workspace/claude/logd.py > /workspace/logs/logd.log 2>&1 &
-        echo $! > /workspace/pids/logd.pid
-        print_ok "logd démarré (PID $(cat /workspace/pids/logd.pid))"
+        print_err "sshd port 2222 non démarré"
+        echo "  Cause probable : /usr/sbin/sshd absent ou config incorrecte"
+        echo "  Action : apt-get install openssh-server && bash install.sh"
+        exit 1
     fi
 
     echo ""
 
     # ──────────────────────────────────────────────
-    # [6/6] Écriture start.sh (persistance reboot)
+    # [6/7] Démarrage logd en background
     # ──────────────────────────────────────────────
-    print_step "6/6" "Écriture start.sh"
+    print_step "6/7" "Démarrage logd"
 
-    cp "${SCRIPT_DIR}/pod/start.sh" /workspace/start.sh
-    chmod +x /workspace/start.sh
-    print_ok "start.sh → /workspace/start.sh"
+    # Vérifier si déjà en cours d'exécution
+    if [ -f "${WORKSPACE}/pids/logd.pid" ] && kill -0 "$(cat "${WORKSPACE}/pids/logd.pid")" 2>/dev/null; then
+        print_warn "logd déjà en cours d'exécution (PID $(cat "${WORKSPACE}/pids/logd.pid")) — skip"
+    else
+        PYTHONUNBUFFERED=1 nohup python3 "${CLAUDE_DIR}/logd.py" \
+            > "${WORKSPACE}/logs/logd.log" 2>&1 &
+        echo $! > "${WORKSPACE}/pids/logd.pid"
+        print_ok "logd démarré (PID $(cat "${WORKSPACE}/pids/logd.pid"))"
+    fi
+
+    # Test logd (attendre 2s qu'il démarre)
+    sleep 2
+    if kill -0 "$(cat "${WORKSPACE}/pids/logd.pid" 2>/dev/null)" 2>/dev/null; then
+        print_ok "logd actif"
+    else
+        print_err "logd s'est arrêté — voir ${WORKSPACE}/logs/logd.log"
+        tail -20 "${WORKSPACE}/logs/logd.log" 2>/dev/null
+        exit 1
+    fi
+
+    echo ""
+
+    # ──────────────────────────────────────────────
+    # [7/7] Écriture start.sh (persistance reboot)
+    # ──────────────────────────────────────────────
+    print_step "7/7" "Écriture start.sh"
+
+    cp "${SCRIPT_DIR}/pod/start.sh" "${WORKSPACE}/start.sh"
+    chmod +x "${WORKSPACE}/start.sh"
+    print_ok "start.sh → ${WORKSPACE}/start.sh"
 
     echo ""
 
@@ -210,21 +262,38 @@ SSHD_EOF
     echo -e "${GREEN}✓ Pod configuré.${NC}"
     echo ""
 
-    if [ -s "$SSHD_CLAUDE_KEYS" ]; then
+    # Guidage dépôt clé publique
+    if [ -s "${CLAUDE_DIR}/authorized_keys" ]; then
         echo "Clés autorisées actuelles :"
         echo ""
-        cat "$SSHD_CLAUDE_KEYS"
+        cat "${CLAUDE_DIR}/authorized_keys"
     else
-        echo "Aucune clé publique configurée."
-        echo "Déposez votre clé publique Claude Code dans :"
-        echo "  ${SSHD_CLAUDE_KEYS}"
+        echo ""
+        echo "════════════════════════════════════════════════════════"
+        echo "⚠  Aucune clé Claude Code configurée."
+        echo ""
+        echo "Sur votre MACHINE LOCALE, exécutez :"
+        echo ""
+        echo "  cat ~/.ssh/claude_code_ed25519.pub | ssh -p {PORT_22} root@{HOST} \\"
+        echo "    'cat >> /workspace/claude/authorized_keys'"
+        echo ""
+        echo "Ou copiez-collez votre clé publique directement :"
+        echo "  (contenu de ~/.ssh/claude_code_ed25519.pub sur votre machine)"
+        echo ""
+        echo "Puis testez depuis votre machine :"
+        echo "  ssh -p 2222 root@{HOST} 'podctl status'"
+        echo "════════════════════════════════════════════════════════"
     fi
 
     echo ""
-    echo "Pour configurer votre machine locale :"
+    echo "Fichiers persistants (survivent aux reboots) :"
+    echo "  ${CLAUDE_DIR}/podctl"
+    echo "  ${CLAUDE_DIR}/sshd_claude.conf.template"
+    echo "  ${CLAUDE_DIR}/hostkeys/"
+    echo "  ${CLAUDE_DIR}/authorized_keys"
     echo ""
-    echo "  git clone https://github.com/bondazclement/runpod-claude-tool.git"
-    echo "  cd runpod-claude-tool && bash install.sh"
+    echo "Après un reboot du pod, lancez :"
+    echo "  /workspace/start.sh"
     echo ""
     echo -e "${BOLD}════════════════════════════════════════════════════${NC}"
 }
