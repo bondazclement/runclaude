@@ -1,42 +1,47 @@
 #!/usr/bin/env bash
-# start.sh — Relance des services Claude Code après reboot du pod
-# Placé dans /workspace/start.sh pour persister entre les redémarrages.
-
+# start.sh — Relance services Claude après reboot RunPod.
 set -euo pipefail
+
+WORKSPACE="${WORKSPACE:-/workspace}"
+CLAUDE_DIR="${WORKSPACE}/claude"
+LOGS_DIR="${WORKSPACE}/logs"
+PIDS_DIR="${WORKSPACE}/pids"
+SSHD_TEMPLATE="${CLAUDE_DIR}/sshd_claude_config.template"
+SSHD_CONFIG="/etc/ssh/sshd_claude_config"
+
+mkdir -p "${LOGS_DIR}" "${PIDS_DIR}" "${CLAUDE_DIR}"
 
 echo "═══ Claude Code services — start.sh ═══"
 
-# ─── sshd dédié port 2222 ────────────────────────────────────────────
-
-SSHD_CONFIG="/etc/ssh/sshd_claude_config"
-
-if pgrep -f "sshd.*sshd_claude_config" >/dev/null 2>&1; then
-    echo "✓ sshd (port 2222) déjà en cours"
+# Réinstallation podctl depuis volume persistant
+if [[ -x "${CLAUDE_DIR}/podctl" ]]; then
+  install -m 0755 "${CLAUDE_DIR}/podctl" /usr/local/bin/podctl
+  echo "✓ podctl réinstallé"
 else
-    if [ -f "$SSHD_CONFIG" ]; then
-        /usr/sbin/sshd -f "$SSHD_CONFIG"
-        echo "✓ sshd (port 2222) démarré"
-    else
-        echo "✗ sshd config absente — relancez install.sh"
-    fi
+  echo "✗ ${CLAUDE_DIR}/podctl absent — relancez install.sh"
 fi
 
-# ─── logd ─────────────────────────────────────────────────────────────
-
-LOGD_SCRIPT="/workspace/claude/logd.py"
-LOGD_PID_FILE="/workspace/pids/logd.pid"
-
-if [ -f "$LOGD_PID_FILE" ] && kill -0 "$(cat "$LOGD_PID_FILE")" 2>/dev/null; then
-    echo "✓ logd déjà en cours (PID $(cat "$LOGD_PID_FILE"))"
+# Reconstruction config sshd depuis template persistant
+if [[ -f "${SSHD_TEMPLATE}" ]]; then
+  install -m 0644 "${SSHD_TEMPLATE}" "${SSHD_CONFIG}"
+  pkill -f "sshd.*sshd_claude_config" >/dev/null 2>&1 || true
+  /usr/sbin/sshd -f "${SSHD_CONFIG}"
+  echo "✓ sshd (port 2222) actif"
 else
-    if [ -f "$LOGD_SCRIPT" ]; then
-        mkdir -p /workspace/pids /workspace/logs
-        nohup python3 "$LOGD_SCRIPT" > /workspace/logs/logd.log 2>&1 &
-        echo $! > "$LOGD_PID_FILE"
-        echo "✓ logd démarré (PID $(cat "$LOGD_PID_FILE"))"
-    else
-        echo "✗ logd.py absent — relancez install.sh"
-    fi
+  echo "✗ template sshd absent (${SSHD_TEMPLATE})"
+fi
+
+LOGD_PID_FILE="${PIDS_DIR}/logd.pid"
+if [[ -f "${LOGD_PID_FILE}" ]] && kill -0 "$(cat "${LOGD_PID_FILE}")" 2>/dev/null; then
+  echo "✓ logd déjà en cours"
+else
+  if [[ -f "${CLAUDE_DIR}/logd.py" ]]; then
+    PYTHONUNBUFFERED=1 nohup python3 "${CLAUDE_DIR}/logd.py" > "${LOGS_DIR}/logd.log" 2>&1 &
+    echo $! > "${LOGD_PID_FILE}"
+    echo "✓ logd démarré"
+  else
+    echo "✗ logd.py absent (${CLAUDE_DIR}/logd.py)"
+  fi
 fi
 
 echo "═══ Tous les services vérifiés ═══"

@@ -1,513 +1,371 @@
 #!/usr/bin/env python3
-"""podctl — CLI principale pour Claude Code sur pod RunPod.
-
-Interface unique structurée (JSON) pour le monitoring et le contrôle du pod.
-Toutes les sorties sont en JSON pour un parsing fiable par Claude Code.
-"""
+"""podctl — CLI JSON pour pods RunPod."""
 
 import argparse
 import json
 import os
+import re
+import shutil
+import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-STREAM_FILE = "/workspace/claude/stream.jsonl"
-MONITOR_STATE = "/workspace/claude/monitor_state.json"
-LOGS_DIR = "/workspace/logs"
-PIDS_DIR = "/workspace/pids"
+WORKSPACE_DIR = os.environ.get("WORKSPACE_DIR", "/workspace")
+CLAUDE_DIR = os.path.join(WORKSPACE_DIR, "claude")
+PIDS_DIR = os.path.join(WORKSPACE_DIR, "pids")
+STREAM_FILE = os.path.join(CLAUDE_DIR, "stream.jsonl")
+
+running_watch = True
 
 
-def json_output(data):
-    """Print JSON to stdout and exit."""
-    print(json.dumps(data, ensure_ascii=False))
-    sys.exit(0)
+def _stop_watch(_sig, _frame):
+    global running_watch
+    running_watch = False
 
 
-def json_error(msg, code=1):
-    """Print error JSON to stdout and exit."""
-    print(json.dumps({"error": msg}))
-    sys.exit(code)
+def emit(payload):
+    print(json.dumps(payload, ensure_ascii=False))
 
 
-def run_cmd(cmd, timeout=10):
-    """Run a shell command and return stdout, stderr, returncode."""
+def json_error(message, command=None, partial=False):
+    emit({"error": message, "command": command, "partial": partial, "ts": int(time.time())})
+
+
+def run_cmd(command, timeout=10):
     try:
-        result = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True, timeout=timeout
-        )
-        return result.stdout.strip(), result.stderr.strip(), result.returncode
+        proc = subprocess.run(command, shell=isinstance(command, str), capture_output=True, text=True, timeout=timeout)
+        return proc.stdout.strip(), proc.stderr.strip(), proc.returncode
     except subprocess.TimeoutExpired:
         return "", "timeout", 124
+    except Exception as exc:
+        return "", str(exc), 1
 
 
-# ─── status ───────────────────────────────────────────────────────────
-
-def cmd_status(_args):
-    """Snapshot global du pod."""
-    data = {"ts": int(time.time()), "type": "status"}
-
-    # Hostname & uptime
-    hostname, _, _ = run_cmd("hostname")
-    uptime, _, _ = run_cmd("uptime -p")
-    data["hostname"] = hostname
-    data["uptime"] = uptime
-
-    # CPU & RAM
+def get_psutil():
     try:
         import psutil
-        mem = psutil.virtual_memory()
-        data["cpu_pct"] = psutil.cpu_percent(interval=0.5)
-        data["ram"] = {
-            "used_gb": round(mem.used / (1024**3), 1),
-            "total_gb": round(mem.total / (1024**3), 1),
-            "pct": mem.percent,
-        }
-    except ImportError:
-        data["cpu_pct"] = None
-        data["ram"] = None
-
-    # Disk
-    try:
-        import psutil
-        disk = psutil.disk_usage("/workspace")
-        data["disk"] = {
-            "used_gb": round(disk.used / (1024**3), 1),
-            "total_gb": round(disk.total / (1024**3), 1),
-            "free_gb": round(disk.free / (1024**3), 1),
-            "pct": disk.percent,
-        }
-    except (ImportError, FileNotFoundError):
-        data["disk"] = None
-
-    # GPU
-    data["gpu"] = _get_gpu_info()
-
-    # Services
-    data["services"] = _get_services_status()
-
-    # Stream file size
-    stream_path = Path(STREAM_FILE)
-    if stream_path.exists():
-        data["stream_size_mb"] = round(stream_path.stat().st_size / (1024**2), 1)
-    else:
-        data["stream_size_mb"] = 0
-
-    json_output(data)
-
-
-# ─── logs ─────────────────────────────────────────────────────────────
-
-def cmd_logs(args):
-    """Logs filtrés et formatés depuis stream.jsonl."""
-    subcmd = args.logs_subcmd
-
-    if subcmd == "recent":
-        duration = args.duration or "5m"
-        seconds = _parse_duration(duration)
-        cutoff = time.time() - seconds
-        lines = _read_stream_since(cutoff)
-        json_output({"type": "logs_recent", "duration": duration, "count": len(lines), "entries": lines[-200:]})
-
-    elif subcmd == "filter":
-        level = args.level.upper()
-        duration = args.duration or "1h"
-        seconds = _parse_duration(duration)
-        cutoff = time.time() - seconds
-        lines = _read_stream_since(cutoff)
-        filtered = [l for l in lines if l.get("level", "").upper() == level]
-        json_output({"type": "logs_filter", "level": level, "duration": duration, "count": len(filtered), "entries": filtered[-100:]})
-
-    elif subcmd == "search":
-        import re
-        pattern = args.pattern
-        duration = args.duration or "30m"
-        seconds = _parse_duration(duration)
-        cutoff = time.time() - seconds
-        lines = _read_stream_since(cutoff)
-        try:
-            regex = re.compile(pattern, re.IGNORECASE)
-        except re.error as e:
-            json_error(f"Invalid regex: {e}")
-        matched = [l for l in lines if regex.search(l.get("msg", "") + l.get("source", ""))]
-        json_output({"type": "logs_search", "pattern": pattern, "duration": duration, "count": len(matched), "entries": matched[-100:]})
-
-    elif subcmd == "kernel":
-        kernel_id = args.kernel_id
-        count = int(args.count or 20)
-        lines = _read_stream_all()
-        filtered = [l for l in lines if l.get("source", "").startswith("jupyter.kernel") and kernel_id in l.get("kernel_id", "")]
-        json_output({"type": "logs_kernel", "kernel_id": kernel_id, "count": len(filtered[-count:]), "entries": filtered[-count:]})
-
-    else:
-        json_error(f"Unknown logs subcommand: {subcmd}")
-
-
-# ─── ps ───────────────────────────────────────────────────────────────
-
-def cmd_ps(_args):
-    """Processus actifs."""
-    try:
-        import psutil
-        procs = []
-        for proc in psutil.process_iter(["pid", "name", "cpu_percent", "memory_info", "create_time", "cmdline"]):
-            try:
-                info = proc.info
-                # Skip kernel threads and very short-lived processes
-                if info["pid"] <= 2:
-                    continue
-                cmdline = " ".join(info["cmdline"][:5]) if info["cmdline"] else info["name"]
-                procs.append({
-                    "pid": info["pid"],
-                    "name": info["name"],
-                    "cmd": cmdline[:200],
-                    "cpu_pct": round(info["cpu_percent"] or 0, 1),
-                    "ram_mb": round((info["memory_info"].rss if info["memory_info"] else 0) / (1024**2), 1),
-                    "uptime_s": int(time.time() - info["create_time"]) if info["create_time"] else 0,
-                })
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-
-        # Sort by CPU usage descending, top 30
-        procs.sort(key=lambda p: p["cpu_pct"], reverse=True)
-        json_output({"type": "ps", "count": len(procs), "processes": procs[:30]})
-
-    except ImportError:
-        # Fallback to ps command
-        stdout, _, _ = run_cmd("ps aux --sort=-%cpu | head -31")
-        json_output({"type": "ps", "raw": stdout})
-
-
-# ─── gpu ──────────────────────────────────────────────────────────────
-
-def cmd_gpu(_args):
-    """État GPU détaillé."""
-    info = _get_gpu_info()
-    if info is None:
-        json_output({"type": "gpu", "available": False, "reason": "nvidia-smi not found"})
-    else:
-        json_output({"type": "gpu", "available": True, "gpus": info})
-
-
-# ─── exec ─────────────────────────────────────────────────────────────
-
-def cmd_exec(args):
-    """Exécuter une commande et retourner le résultat structuré."""
-    command = args.command
-    timeout = int(args.timeout) if args.timeout else 30
-
-    start = time.time()
-    stdout, stderr, rc = run_cmd(command, timeout=timeout)
-    elapsed = round(time.time() - start, 2)
-
-    json_output({
-        "type": "exec",
-        "command": command,
-        "returncode": rc,
-        "stdout": stdout[:10000],  # Cap output
-        "stderr": stderr[:5000],
-        "elapsed_s": elapsed,
-    })
-
-
-# ─── summary ──────────────────────────────────────────────────────────
-
-def cmd_summary(_args):
-    """Résumé compact (<300 tokens)."""
-    data = {"ts": int(time.time()), "type": "summary"}
-
-    # Services alive?
-    data["services"] = _get_services_status()
-
-    # GPU one-liner
-    gpu = _get_gpu_info()
-    if gpu:
-        g = gpu[0]
-        data["gpu"] = f"{g.get('util_pct', '?')}% util, {g.get('mem_used_mb', '?')}/{g.get('mem_total_mb', '?')}MB"
-    else:
-        data["gpu"] = "n/a"
-
-    # RAM one-liner
-    try:
-        import psutil
-        mem = psutil.virtual_memory()
-        data["ram"] = f"{round(mem.used / (1024**3), 1)}/{round(mem.total / (1024**3), 1)}GB ({mem.percent}%)"
-    except ImportError:
-        data["ram"] = "n/a"
-
-    # Disk one-liner
-    try:
-        import psutil
-        disk = psutil.disk_usage("/workspace")
-        data["disk"] = f"{round(disk.free / (1024**3), 1)}GB free ({disk.percent}% used)"
-    except (ImportError, FileNotFoundError):
-        data["disk"] = "n/a"
-
-    # Top process
-    try:
-        import psutil
-        top = max(psutil.process_iter(["pid", "name", "cpu_percent"]),
-                  key=lambda p: p.info["cpu_percent"] or 0, default=None)
-        if top and top.info["cpu_percent"]:
-            data["top_proc"] = f"{top.info['name']} (PID {top.info['pid']}) {top.info['cpu_percent']}% CPU"
-        else:
-            data["top_proc"] = "idle"
-    except ImportError:
-        data["top_proc"] = "n/a"
-
-    # Last log event
-    stream_path = Path(STREAM_FILE)
-    if stream_path.exists() and stream_path.stat().st_size > 0:
-        try:
-            last_line = _tail_file(STREAM_FILE, 1)
-            if last_line:
-                entry = json.loads(last_line[0])
-                data["last_event"] = {
-                    "ts": entry.get("ts"),
-                    "source": entry.get("source"),
-                    "msg": entry.get("msg", "")[:100],
-                }
-        except (json.JSONDecodeError, IndexError):
-            data["last_event"] = None
-    else:
-        data["last_event"] = None
-
-    json_output(data)
-
-
-# ─── jupyter ──────────────────────────────────────────────────────────
-
-def cmd_jupyter(args):
-    """Jupyter operations."""
-    subcmd = args.jupyter_subcmd
-
-    if subcmd == "kernels":
-        stdout, stderr, rc = run_cmd("jupyter kernelspec list --json 2>/dev/null || echo '{}'")
-        try:
-            kernels = json.loads(stdout)
-        except json.JSONDecodeError:
-            kernels = {"raw": stdout}
-
-        # Also get running kernels via API
-        api_out, _, _ = run_cmd("curl -s http://localhost:8888/api/kernels 2>/dev/null || echo '[]'")
-        try:
-            running = json.loads(api_out)
-        except json.JSONDecodeError:
-            running = []
-
-        json_output({"type": "jupyter_kernels", "specs": kernels, "running": running})
-
-    elif subcmd == "outputs":
-        kernel_id = args.kernel_id
-        count = int(args.count or 20)
-        lines = _read_stream_all()
-        filtered = [l for l in lines if "jupyter" in l.get("source", "") and kernel_id in l.get("kernel_id", "")]
-        json_output({"type": "jupyter_outputs", "kernel_id": kernel_id, "count": len(filtered[-count:]), "entries": filtered[-count:]})
-
-    else:
-        json_error(f"Unknown jupyter subcommand: {subcmd}")
-
-
-# ─── Helpers ──────────────────────────────────────────────────────────
-
-def _get_gpu_info():
-    """Get GPU info via nvidia-smi."""
-    stdout, _, rc = run_cmd(
-        "nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu "
-        "--format=csv,noheader,nounits 2>/dev/null"
-    )
-    if rc != 0 or not stdout:
+        return psutil
+    except Exception:
         return None
 
-    gpus = []
-    for line in stdout.strip().split("\n"):
-        parts = [p.strip() for p in line.split(",")]
-        if len(parts) >= 6:
-            gpus.append({
-                "index": int(parts[0]),
-                "name": parts[1],
-                "util_pct": int(parts[2]),
-                "mem_used_mb": int(parts[3]),
-                "mem_total_mb": int(parts[4]),
-                "temp_c": int(parts[5]),
-            })
-    return gpus if gpus else None
 
-
-def _get_services_status():
-    """Check status of managed services."""
-    services = {}
-
-    # logd
-    logd_pid_file = Path(f"{PIDS_DIR}/logd.pid")
-    if logd_pid_file.exists():
+def get_services_status():
+    services = {"logd": {"alive": False, "pid": None}, "sshd_claude": {"alive": False, "pid": None}}
+    pid_file = Path(PIDS_DIR) / "logd.pid"
+    if pid_file.exists():
         try:
-            pid = int(logd_pid_file.read_text().strip())
-            alive = os.path.exists(f"/proc/{pid}")
-            services["logd"] = {"pid": pid, "alive": alive}
-        except (ValueError, OSError):
-            services["logd"] = {"pid": None, "alive": False}
-    else:
-        services["logd"] = {"pid": None, "alive": False}
+            pid = int(pid_file.read_text().strip())
+            services["logd"] = {"alive": Path(f"/proc/{pid}").exists(), "pid": pid}
+        except Exception:
+            pass
 
-    # sshd claude (port 2222)
-    stdout, _, _ = run_cmd("pgrep -f 'sshd.*sshd_claude_config' | head -1")
-    if stdout:
-        services["sshd_claude"] = {"pid": int(stdout), "alive": True}
-    else:
-        services["sshd_claude"] = {"pid": None, "alive": False}
-
+    out, _, rc = run_cmd("pgrep -f 'sshd.*sshd_claude_config' | head -1", timeout=5)
+    if rc == 0 and out:
+        services["sshd_claude"] = {"alive": True, "pid": int(out)}
     return services
 
 
-def _parse_duration(s):
-    """Parse duration string like '5m', '1h', '30s' to seconds."""
-    s = s.strip().lower()
-    if s.endswith("s"):
-        return int(s[:-1])
-    elif s.endswith("m"):
-        return int(s[:-1]) * 60
-    elif s.endswith("h"):
-        return int(s[:-1]) * 3600
-    elif s.endswith("d"):
-        return int(s[:-1]) * 86400
-    else:
-        try:
-            return int(s)
-        except ValueError:
-            return 300  # default 5m
-
-
-def _read_stream_since(cutoff_ts):
-    """Read stream.jsonl entries since cutoff timestamp."""
-    entries = []
-    stream_path = Path(STREAM_FILE)
-    if not stream_path.exists():
-        return entries
-
-    # Read from end for efficiency
-    lines = _tail_file(STREAM_FILE, 5000)
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            entry = json.loads(line)
-            if entry.get("ts", 0) >= cutoff_ts:
-                entries.append(entry)
-        except json.JSONDecodeError:
-            continue
-
-    return entries
-
-
-def _read_stream_all():
-    """Read all stream.jsonl entries."""
-    entries = []
-    stream_path = Path(STREAM_FILE)
-    if not stream_path.exists():
-        return entries
-
-    with open(STREAM_FILE, "r") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entries.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-
-    return entries
-
-
-def _tail_file(filepath, n):
-    """Read last n lines of a file efficiently."""
-    try:
-        stdout, _, _ = run_cmd(f"tail -n {n} '{filepath}'")
-        return stdout.split("\n") if stdout else []
-    except Exception:
+def read_stream_last(n=2000):
+    p = Path(STREAM_FILE)
+    if not p.exists():
         return []
+    out, _, rc = run_cmd(f"tail -n {int(n)} '{STREAM_FILE}'", timeout=5)
+    if rc != 0:
+        return []
+    entries = []
+    for line in out.splitlines():
+        try:
+            entries.append(json.loads(line))
+        except Exception:
+            continue
+    return entries
 
 
-# ─── Main ─────────────────────────────────────────────────────────────
+def cmd_status(_args):
+    try:
+        psutil = get_psutil()
+        mem = disk = cpu = None
+        unavailable_reason = None
+        if psutil:
+            mem_obj = psutil.virtual_memory()
+            disk_obj = psutil.disk_usage(WORKSPACE_DIR if os.path.isdir(WORKSPACE_DIR) else "/")
+            mem = {"used_mb": int(mem_obj.used / 1024 / 1024), "total_mb": int(mem_obj.total / 1024 / 1024), "pct": mem_obj.percent}
+            disk = {"free_gb": round(disk_obj.free / 1024**3, 2), "total_gb": round(disk_obj.total / 1024**3, 2), "pct": disk_obj.percent}
+            cpu = {"pct": psutil.cpu_percent(interval=0.2)}
+        else:
+            unavailable_reason = "psutil not installed"
+
+        emit({
+            "type": "status",
+            "ts": int(time.time()),
+            "services": get_services_status(),
+            "mem": mem,
+            "disk": disk,
+            "cpu": cpu,
+            "unavailable_reason": unavailable_reason,
+        })
+    except Exception as exc:
+        json_error(str(exc), command="status", partial=True)
+
+
+def cmd_ps(_args):
+    try:
+        psutil = get_psutil()
+        if not psutil:
+            json_error("psutil not installed", command="ps", partial=True)
+            return
+        procs = []
+        for p in psutil.process_iter(["pid", "name", "cpu_percent", "memory_info"]):
+            try:
+                mi = p.info.get("memory_info")
+                procs.append({
+                    "pid": p.info.get("pid"),
+                    "name": p.info.get("name"),
+                    "cpu_pct": p.info.get("cpu_percent", 0.0),
+                    "mem_mb": round((mi.rss if mi else 0) / 1024 / 1024, 2),
+                })
+            except Exception:
+                continue
+        emit({"type": "ps", "ts": int(time.time()), "processes": sorted(procs, key=lambda x: x.get("cpu_pct", 0), reverse=True)[:100]})
+    except Exception as exc:
+        json_error(str(exc), command="ps", partial=True)
+
+
+def cmd_gpu(_args):
+    try:
+        out, err, rc = run_cmd("nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu --format=csv,noheader,nounits", timeout=5)
+        if rc != 0:
+            emit({"type": "gpu", "ts": int(time.time()), "gpus": None, "unavailable_reason": err or "nvidia-smi not available"})
+            return
+        gpus = []
+        for line in out.splitlines():
+            try:
+                i, n, u, mu, mt, t = [x.strip() for x in line.split(",")]
+                gpus.append({"index": int(i), "name": n, "util_pct": int(u), "mem_used_mb": int(mu), "mem_total_mb": int(mt), "temp_c": int(t)})
+            except Exception:
+                continue
+        emit({"type": "gpu", "ts": int(time.time()), "gpus": gpus})
+    except Exception as exc:
+        json_error(str(exc), command="gpu", partial=True)
+
+
+def cmd_exec(args):
+    try:
+        timeout = int(args.timeout)
+        out, err, rc = run_cmd(args.command, timeout=timeout)
+        emit({"type": "exec", "ts": int(time.time()), "command": args.command, "rc": rc, "stdout": out, "stderr": err})
+    except Exception as exc:
+        json_error(str(exc), command="exec")
+
+
+def _parse_duration(s):
+    m = re.match(r"^(\d+)([smhd]?)$", s.strip().lower())
+    if not m:
+        return 300
+    val = int(m.group(1))
+    unit = m.group(2) or "s"
+    return val * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+
+
+def cmd_logs(args):
+    try:
+        entries = read_stream_last(5000)
+        now = int(time.time())
+        result = []
+        sub = args.logs_subcmd
+
+        if sub == "recent":
+            cutoff = now - _parse_duration(args.duration)
+            result = [e for e in entries if e.get("ts", 0) >= cutoff]
+        elif sub == "filter":
+            cutoff = now - _parse_duration(args.duration)
+            level = args.level.lower()
+            result = [e for e in entries if e.get("ts", 0) >= cutoff and str(e.get("level", "")).lower() == level]
+        elif sub == "search":
+            cutoff = now - _parse_duration(args.duration)
+            pat = re.compile(args.pattern, re.IGNORECASE)
+            result = [e for e in entries if e.get("ts", 0) >= cutoff and pat.search(json.dumps(e, ensure_ascii=False))]
+        elif sub == "kernel":
+            kid = args.kernel_id
+            count = int(args.count)
+            result = [e for e in entries if kid in json.dumps(e, ensure_ascii=False)][-count:]
+        else:
+            json_error("logs subcommand required", command="logs")
+            return
+
+        emit({"type": "logs", "subcommand": sub, "ts": now, "count": len(result), "entries": result[-200:]})
+    except Exception as exc:
+        json_error(str(exc), command="logs", partial=True)
+
+
+def cmd_jupyter(args):
+    try:
+        if args.jupyter_subcmd == "kernels":
+            out, err, rc = run_cmd("jupyter server list --json 2>/dev/null", timeout=5)
+            emit({"type": "jupyter", "subcommand": "kernels", "ts": int(time.time()), "rc": rc, "stdout": out, "stderr": err})
+            return
+        if args.jupyter_subcmd == "outputs":
+            entries = read_stream_last(4000)
+            kid = args.kernel_id
+            count = int(args.count)
+            out_entries = [e for e in entries if e.get("source") == "jupyter.output" and kid in json.dumps(e)][-count:]
+            emit({"type": "jupyter", "subcommand": "outputs", "ts": int(time.time()), "kernel_id": kid, "count": len(out_entries), "entries": out_entries})
+            return
+        json_error("unknown jupyter subcommand", command="jupyter")
+    except Exception as exc:
+        json_error(str(exc), command="jupyter", partial=True)
+
+
+def cmd_summary(_args):
+    try:
+        services = get_services_status()
+        gpu_out, gpu_err, gpu_rc = run_cmd("nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits", timeout=5)
+        gpu = []
+        if gpu_rc == 0 and gpu_out:
+            for line in gpu_out.splitlines()[:2]:
+                try:
+                    u, mu, mt = [x.strip() for x in line.split(",")]
+                    gpu.append({"util_pct": int(u), "mem_used_mb": int(mu), "mem_total_mb": int(mt)})
+                except Exception:
+                    continue
+
+        entries = read_stream_last(200)
+        alerts = [e for e in entries if str(e.get("level", "")).upper() in {"ERROR", "WARNING"}][-10:]
+        emit({"type": "summary", "ts": int(time.time()), "services": services, "gpu": gpu if gpu else None, "alerts": alerts})
+    except Exception as exc:
+        json_error(str(exc), command="summary", partial=True)
+
+
+def cmd_health(_args):
+    try:
+        checks = {}
+        critical = []
+        warnings = []
+
+        services = get_services_status()
+        checks["logd_alive"] = bool(services["logd"]["alive"])
+        checks["sshd_claude_alive"] = bool(services["sshd_claude"]["alive"])
+
+        stream_path = Path(STREAM_FILE)
+        checks["stream_file_exists"] = stream_path.exists()
+        if stream_path.exists():
+            age = time.time() - stream_path.stat().st_mtime
+            checks["stream_recently_written"] = age < 30
+        else:
+            checks["stream_recently_written"] = False
+
+        total, used, free = shutil.disk_usage(WORKSPACE_DIR if os.path.isdir(WORKSPACE_DIR) else "/")
+        checks["disk_not_critical"] = free > 5 * 1024**3
+
+        _, err, rc = run_cmd("nvidia-smi -L", timeout=5)
+        if rc == 0:
+            checks["gpu_accessible"] = True
+        elif "not found" in (err or ""):
+            checks["gpu_accessible"] = None
+            warnings.append("GPU non détecté (nvidia-smi absent)")
+        else:
+            checks["gpu_accessible"] = False
+
+        if not checks["logd_alive"]:
+            critical.append("logd mort — relancer /workspace/start.sh")
+        if not checks["sshd_claude_alive"]:
+            critical.append("sshd Claude arrêté — relancer /workspace/start.sh")
+        if not checks["stream_file_exists"]:
+            critical.append("stream.jsonl absent — vérifier /workspace/claude")
+        if not checks["stream_recently_written"]:
+            critical.append("stream.jsonl non mis à jour depuis >30s")
+        if not checks["disk_not_critical"]:
+            critical.append("espace disque critique (<5GB libres)")
+        if checks["gpu_accessible"] is False:
+            critical.append("GPU inaccessible — vérifier driver NVIDIA")
+
+        emit({
+            "type": "health",
+            "ts": int(time.time()),
+            "healthy": len(critical) == 0,
+            "checks": checks,
+            "warnings": warnings,
+            "critical": critical,
+        })
+    except Exception as exc:
+        json_error(str(exc), command="health", partial=True)
+
+
+def cmd_watch(args):
+    signal.signal(signal.SIGINT, _stop_watch)
+    signal.signal(signal.SIGTERM, _stop_watch)
+    interval = int(args.interval)
+    cycle = 0
+    while running_watch:
+        cycle += 1
+        services = get_services_status()
+        entries = read_stream_last(80)
+        alerts = [e for e in entries if str(e.get("level", "")).upper() in {"ERROR", "WARNING"}][-5:]
+        emit({"type": "summary", "cycle": cycle, "ts": int(time.time()), "services": services, "alerts": alerts})
+        time.sleep(max(1, interval))
+
 
 def main():
-    parser = argparse.ArgumentParser(
-        prog="podctl",
-        description="CLI pour Claude Code sur pod RunPod. Toutes les sorties sont en JSON.",
-    )
-    subparsers = parser.add_subparsers(dest="command", help="Commande")
+    parser = argparse.ArgumentParser(prog="podctl", description="CLI JSON RunPod")
+    sub = parser.add_subparsers(dest="command")
+    sub.add_parser("status")
 
-    # status
-    subparsers.add_parser("status", help="Snapshot global du pod")
+    logs = sub.add_parser("logs")
+    logs_sub = logs.add_subparsers(dest="logs_subcmd")
+    r = logs_sub.add_parser("recent")
+    r.add_argument("duration", nargs="?", default="5m")
+    f = logs_sub.add_parser("filter")
+    f.add_argument("level")
+    f.add_argument("duration", nargs="?", default="1h")
+    s = logs_sub.add_parser("search")
+    s.add_argument("pattern")
+    s.add_argument("duration", nargs="?", default="30m")
+    k = logs_sub.add_parser("kernel")
+    k.add_argument("kernel_id")
+    k.add_argument("count", nargs="?", default="20")
 
-    # logs
-    logs_parser = subparsers.add_parser("logs", help="Logs filtrés")
-    logs_sub = logs_parser.add_subparsers(dest="logs_subcmd")
+    sub.add_parser("ps")
+    sub.add_parser("gpu")
+    ex = sub.add_parser("exec")
+    ex.add_argument("command")
+    ex.add_argument("--timeout", default="30")
+    sub.add_parser("summary")
+    sub.add_parser("health")
+    w = sub.add_parser("watch")
+    w.add_argument("interval", nargs="?", default="30")
 
-    recent = logs_sub.add_parser("recent", help="Logs récents")
-    recent.add_argument("duration", nargs="?", default="5m", help="Durée (ex: 5m, 1h)")
-
-    filt = logs_sub.add_parser("filter", help="Filtrer par niveau")
-    filt.add_argument("level", help="Niveau (error, warning, info)")
-    filt.add_argument("duration", nargs="?", default="1h", help="Durée")
-
-    search = logs_sub.add_parser("search", help="Recherche par pattern")
-    search.add_argument("pattern", help="Regex pattern")
-    search.add_argument("duration", nargs="?", default="30m", help="Durée")
-
-    kernel = logs_sub.add_parser("kernel", help="Logs d'un kernel Jupyter")
-    kernel.add_argument("kernel_id", help="ID du kernel (8 premiers chars)")
-    kernel.add_argument("count", nargs="?", default="20", help="Nombre de lignes")
-
-    # ps
-    subparsers.add_parser("ps", help="Processus actifs")
-
-    # gpu
-    subparsers.add_parser("gpu", help="État GPU")
-
-    # exec
-    exec_parser = subparsers.add_parser("exec", help="Exécuter une commande")
-    exec_parser.add_argument("command", help="Commande à exécuter")
-    exec_parser.add_argument("--timeout", default="30", help="Timeout en secondes")
-
-    # summary
-    subparsers.add_parser("summary", help="Résumé compact (<300 tokens)")
-
-    # jupyter
-    jupyter_parser = subparsers.add_parser("jupyter", help="Jupyter operations")
-    jupyter_sub = jupyter_parser.add_subparsers(dest="jupyter_subcmd")
-
-    jupyter_sub.add_parser("kernels", help="Lister les kernels")
-
-    outputs = jupyter_sub.add_parser("outputs", help="Outputs d'un kernel")
-    outputs.add_argument("kernel_id", help="ID du kernel")
-    outputs.add_argument("count", nargs="?", default="20", help="Nombre d'outputs")
+    j = sub.add_parser("jupyter")
+    j_sub = j.add_subparsers(dest="jupyter_subcmd")
+    j_sub.add_parser("kernels")
+    jo = j_sub.add_parser("outputs")
+    jo.add_argument("kernel_id")
+    jo.add_argument("count", nargs="?", default="20")
 
     args = parser.parse_args()
-
     if not args.command:
         parser.print_help()
-        sys.exit(1)
+        return 1
 
-    commands = {
+    handlers = {
         "status": cmd_status,
         "logs": cmd_logs,
         "ps": cmd_ps,
         "gpu": cmd_gpu,
         "exec": cmd_exec,
         "summary": cmd_summary,
+        "health": cmd_health,
+        "watch": cmd_watch,
         "jupyter": cmd_jupyter,
     }
-
-    handler = commands.get(args.command)
-    if handler:
-        handler(args)
-    else:
-        json_error(f"Unknown command: {args.command}")
+    try:
+        handlers[args.command](args)
+    except Exception as exc:
+        json_error(str(exc), command=args.command)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
