@@ -1,12 +1,11 @@
 ---
 name: runpod-monitor
 description: >
-  Charger ce skill EN PLUS de runpod-core quand l'utilisateur
-  demande de surveiller une tâche longue de façon autonome,
-  ou quand une tâche > 30 minutes est lancée sur un pod.
+  Charger ce skill EN PLUS de runpod-core uniquement quand l'utilisateur
+  demande de surveiller une tâche longue de façon autonome, ou quand
+  une tâche estimée > 30 minutes est lancée sur un pod.
   Prérequis : runpod-core chargé et pod configuré.
-  Décrit : mode autonome, polling structuré, multi-agent,
-  gestion du contexte, handoff.
+  Ne pas charger pour des tâches courtes — runpod-core seul suffit.
 ---
 
 # RunPod Monitor — Surveillance autonome de tâches longues

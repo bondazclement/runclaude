@@ -1,0 +1,13 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "jupyter-logstream"
+version = "0.2.0"
+description = "Jupyter Server extension — captures all outputs to stream.jsonl"
+requires-python = ">=3.8"
+dependencies = ["jupyter_server>=1.6"]
+
+[project.entry-points."jupyter_server.extensions"]
+jupyter_logstream = "jupyter_logstream:JupyterLogstreamApp"

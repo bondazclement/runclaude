@@ -16,12 +16,22 @@ from pathlib import Path
 
 # ─── Configuration ────────────────────────────────────────────────────
 
-STREAM_FILE = "/workspace/claude/stream.jsonl"
-LOGS_DIR = "/workspace/logs"
+WORKSPACE_DIR = os.environ.get("WORKSPACE_DIR", "/workspace")
+CLAUDE_DIR = os.path.join(WORKSPACE_DIR, "claude")
+STREAM_FILE = os.path.join(CLAUDE_DIR, "stream.jsonl")
+LOGS_DIR = os.path.join(WORKSPACE_DIR, "logs")
+PIDS_DIR = os.path.join(WORKSPACE_DIR, "pids")
 MAX_STREAM_SIZE_MB = 50
 METRICS_INTERVAL = 5  # seconds
 LOG_WATCH_INTERVAL = 1  # seconds
-ARCHIVE_AGE_HOURS = 6
+
+# System process names to filter (only when low CPU + low RAM)
+SYSTEM_PROC_NAMES = {
+    'kthreadd', 'ksoftirqd', 'kworker', 'rcu_sched', 'rcu_bh',
+    'migration', 'cpuhp', 'watchdog', 'idle_inject', 'irq',
+    'smpboot', 'oom_reaper', 'writeback', 'kcompactd', 'khugepaged',
+    'kswapd', 'scsi_eh', 'kintegrityd', 'bioset', 'kblockd',
+}
 
 # ─── Globals ──────────────────────────────────────────────────────────
 
@@ -86,6 +96,36 @@ class StreamWriter:
             print(f"logd: rotation error: {e}", file=sys.stderr)
 
 
+# ─── Helpers ─────────────────────────────────────────────────────────
+
+def is_system_proc(name):
+    """Check if a process name matches a known system/kernel process."""
+    name_lower = name.lower()
+    return any(s in name_lower for s in SYSTEM_PROC_NAMES)
+
+
+def _read_proc_state(pid):
+    """Read process state from /proc/{pid}/status."""
+    try:
+        with open(f"/proc/{pid}/status", "r") as f:
+            for line in f:
+                if line.startswith("State:"):
+                    state_char = line.split()[1]
+                    state_map = {
+                        'R': 'running',
+                        'S': 'sleeping',
+                        'D': 'uninterruptible',
+                        'Z': 'zombie',
+                        'T': 'stopped',
+                        't': 'tracing_stop',
+                        'X': 'dead',
+                    }
+                    return state_map.get(state_char, state_char)
+    except (OSError, IndexError):
+        pass
+    return "unknown"
+
+
 # ─── Collectors ───────────────────────────────────────────────────────
 
 def collect_gpu(writer):
@@ -112,6 +152,9 @@ def collect_gpu(writer):
                 })
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
+    except Exception as e:
+        writer.write({"source": "logd", "level": "WARNING",
+                      "msg": f"gpu collector error: {e}"})
 
 
 def collect_system(writer):
@@ -134,7 +177,7 @@ def collect_system(writer):
         })
 
         try:
-            disk = psutil.disk_usage("/workspace")
+            disk = psutil.disk_usage(WORKSPACE_DIR)
             writer.write({
                 "source": "system.disk",
                 "free_gb": round(disk.free / (1024**3), 1),
@@ -145,34 +188,59 @@ def collect_system(writer):
 
     except ImportError:
         pass
+    except Exception as e:
+        writer.write({"source": "logd", "level": "WARNING",
+                      "msg": f"system collector error: {e}"})
 
 
 def collect_processes(writer):
-    """Collect active process info."""
+    """Collect active process info with improved filtering."""
     try:
         import psutil
 
         for proc in psutil.process_iter(["pid", "name", "cpu_percent", "memory_info"]):
             try:
                 info = proc.info
-                cpu = info.get("cpu_percent") or 0
-                if cpu < 1 and info["pid"] > 100:
-                    continue  # Skip idle processes
-                ram_mb = round(info["memory_info"].rss / (1024**2)) if info.get("memory_info") else 0
-                if ram_mb < 50 and cpu < 1:
-                    continue  # Skip insignificant processes
+                pid = info["pid"]
 
-                writer.write({
+                # Skip kernel PID 0-2
+                if pid <= 2:
+                    continue
+
+                cpu = info.get("cpu_percent") or 0
+                ram_mb = round(info["memory_info"].rss / (1024**2)) if info.get("memory_info") else 0
+
+                # Only filter if ALL conditions are met:
+                # 1. CPU < 0.5%
+                # 2. RAM < 20MB
+                # 3. Name is a known system process
+                if cpu < 0.5 and ram_mb < 20 and is_system_proc(info["name"]):
+                    continue
+
+                state = _read_proc_state(pid)
+
+                entry = {
                     "source": "system.proc",
-                    "pid": info["pid"],
+                    "pid": pid,
                     "name": info["name"],
                     "cpu_pct": round(cpu, 1),
                     "ram_mb": ram_mb,
-                })
+                    "state": state,
+                }
+
+                # Detect zombies and log with WARNING
+                if state == "zombie":
+                    entry["level"] = "WARNING"
+                    entry["msg"] = "zombie process detected"
+
+                writer.write(entry)
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
     except ImportError:
         pass
+    except Exception as e:
+        writer.write({"source": "logd", "level": "WARNING",
+                      "msg": f"process collector error: {e}"})
 
 
 def collect_dmesg(writer, last_dmesg_ts):
@@ -191,6 +259,37 @@ def collect_dmesg(writer, last_dmesg_ts):
                 })
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
+    except Exception as e:
+        writer.write({"source": "logd", "level": "WARNING",
+                      "msg": f"dmesg collector error: {e}"})
+
+
+# ─── Jupyter Detection ───────────────────────────────────────────────
+
+def detect_jupyter(writer):
+    """Detect if Jupyter Server is running."""
+    try:
+        result = subprocess.run(
+            ["jupyter", "server", "list", "--json"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            for line in result.stdout.strip().split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    server = json.loads(line)
+                    writer.write({
+                        "source": "jupyter.server",
+                        "level": "INFO",
+                        "msg": f"Jupyter server detected: {server.get('url', 'unknown')}",
+                        "token_present": bool(server.get("token")),
+                    })
+                except json.JSONDecodeError:
+                    continue
+    except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
+        pass  # Jupyter absent — silencieux
 
 
 # ─── Log File Watcher ────────────────────────────────────────────────
@@ -263,9 +362,12 @@ def main():
     log_watcher = LogWatcher(writer, LOGS_DIR)
 
     # Check if nvidia-smi is available
-    has_nvidia = subprocess.run(
-        ["which", "nvidia-smi"], capture_output=True
-    ).returncode == 0
+    try:
+        has_nvidia = subprocess.run(
+            ["which", "nvidia-smi"], capture_output=True, timeout=5
+        ).returncode == 0
+    except (subprocess.TimeoutExpired, Exception):
+        has_nvidia = False
 
     # Initialize psutil CPU measurement
     try:
@@ -273,6 +375,9 @@ def main():
         psutil.cpu_percent(interval=0)
     except ImportError:
         print("logd: psutil not available, system metrics limited", file=sys.stderr)
+
+    # Detect Jupyter at startup
+    detect_jupyter(writer)
 
     last_metrics_time = 0
     last_dmesg_ts = int(time.time())
@@ -290,16 +395,40 @@ def main():
 
         # Collect metrics every METRICS_INTERVAL seconds
         if now - last_metrics_time >= METRICS_INTERVAL:
-            if has_nvidia:
-                collect_gpu(writer)
-            collect_system(writer)
-            collect_processes(writer)
-            collect_dmesg(writer, last_dmesg_ts)
+            try:
+                if has_nvidia:
+                    collect_gpu(writer)
+            except Exception as e:
+                writer.write({"source": "logd", "level": "WARNING",
+                              "msg": f"gpu collector error: {e}"})
+
+            try:
+                collect_system(writer)
+            except Exception as e:
+                writer.write({"source": "logd", "level": "WARNING",
+                              "msg": f"system collector error: {e}"})
+
+            try:
+                collect_processes(writer)
+            except Exception as e:
+                writer.write({"source": "logd", "level": "WARNING",
+                              "msg": f"process collector error: {e}"})
+
+            try:
+                collect_dmesg(writer, last_dmesg_ts)
+            except Exception as e:
+                writer.write({"source": "logd", "level": "WARNING",
+                              "msg": f"dmesg collector error: {e}"})
+
             last_dmesg_ts = int(now)
             last_metrics_time = now
 
         # Check log files every LOG_WATCH_INTERVAL seconds
-        log_watcher.check()
+        try:
+            log_watcher.check()
+        except Exception as e:
+            writer.write({"source": "logd", "level": "WARNING",
+                          "msg": f"log watcher error: {e}"})
 
         time.sleep(LOG_WATCH_INTERVAL)
 
